@@ -20,8 +20,10 @@
   html,body{margin:0;padding:0;background:transparent;overflow:hidden;font-family:var(--font);}
 
   /* The card */
+  /* Position: top-left. To move it elsewhere, swap these two values —
+     e.g. right:20px; top:20px;  or  left:20px; bottom:20px; */
   #overlay{
-    position:fixed; left:20px; bottom:20px;
+    position:fixed; left:20px; top:20px;
     display:flex; align-items:center; gap:16px;
     padding:14px 20px 14px 14px;
     background:var(--bg);
@@ -31,7 +33,7 @@
     -webkit-backdrop-filter:blur(10px);
     max-width:440px; min-width:320px;
     color:var(--text);
-    transform:translateY(140%); opacity:0;
+    transform:translateY(-140%); opacity:0;
     transition:transform .5s cubic-bezier(.2,.8,.2,1), opacity .5s;
   }
   #overlay.show{transform:translateY(0); opacity:1;}
@@ -50,6 +52,10 @@
     color:var(--accent); font-weight:700; margin-bottom:3px;
     display:flex; align-items:center; gap:6px;
   }
+  /* Spotify attribution logo — required by Spotify Developer Policy II.4.
+     Keep it visible; don't recolor or distort it (Branding Guidelines). */
+  #eyebrow svg{width:14px; height:14px; flex:0 0 auto;}
+  #overlay a{color:inherit; text-decoration:none;}
   .bars{display:inline-flex; gap:2px; height:11px; align-items:flex-end;}
   .bars span{width:3px; background:var(--accent); border-radius:1px; animation:eq .9s ease-in-out infinite;}
   .bars span:nth-child(2){animation-delay:.2s}
@@ -61,7 +67,7 @@
   #artist{font-size:13px; color:var(--subtext); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; margin-top:1px;}
 
   #progress{margin-top:9px; height:4px; background:rgba(255,255,255,.15); border-radius:4px; overflow:hidden;}
-  #bar{height:100%; width:0; background:var(--accent); border-radius:4px; transition:width .3s linear;}
+  #bar{height:100%; width:0; background:var(--accent); border-radius:4px; transition:width .25s linear;}
   #times{display:flex; justify-content:space-between; font-size:10px; color:var(--subtext); margin-top:4px; font-variant-numeric:tabular-nums;}
 
   /* ============================================================
@@ -87,17 +93,40 @@
   #setup ol{color:#c8c8c8; padding-left:20px; margin:10px 0;}
   #setup small{color:#7a7a7a;}
   .hidden{display:none !important;}
+
+  /* ============================================================
+     DISCONNECT CONTROL — Spotify Developer Policy I.1.2 requires an
+     easily accessible way for the user to disconnect their account.
+     Hidden until hover so it never appears on stream (OBS/Streamlabs
+     browser sources don't receive mouse-over events).
+     Also reachable directly at  <your-url>/?disconnect=1
+     ============================================================ */
+  #disconnect{
+    position:fixed; left:20px; top:112px;
+    font:500 11px var(--font); color:#bbb;
+    background:rgba(0,0,0,.72); border:1px solid #444;
+    padding:5px 10px; border-radius:999px; cursor:pointer;
+    opacity:0; pointer-events:none; transition:opacity .2s;
+  }
+  body:hover #disconnect{opacity:1; pointer-events:auto;}
+  #disconnect:hover{border-color:var(--accent); color:#fff;}
 </style>
 </head>
 <body>
 
 <!-- ============ OVERLAY CARD ============ -->
 <div id="overlay">
-  <img id="art" src="" alt="">
+  <a id="artLink" href="#" target="_blank" rel="noopener">
+    <img id="art" src="" alt="Album cover art">
+  </a>
   <div id="info">
     <div id="eyebrow">
       <span class="bars"><span></span><span></span><span></span><span></span></span>
-      Now Playing
+      <!-- Spotify logo (official mark) + attribution, per Developer Policy II.4 -->
+      <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" aria-label="Spotify" role="img">
+        <path fill="#1ED760" d="M12 0C5.4 0 0 5.4 0 12s5.4 12 12 12 12-5.4 12-12S18.66 0 12 0zm5.521 17.34c-.24.359-.66.48-1.021.24-2.82-1.74-6.36-2.101-10.561-1.141-.418.122-.779-.24-.899-.6-.12-.421.24-.78.6-.9 4.56-1.021 8.52-.6 11.64 1.32.42.18.479.659.241 1.081zm1.44-3.3c-.301.42-.841.6-1.262.3-3.239-1.98-8.159-2.58-11.939-1.38-.479.12-1.02-.12-1.14-.6-.12-.48.12-1.021.6-1.141C9.6 9.9 15 10.561 18.72 12.84c.361.181.54.78.241 1.2zm.12-3.36C15.24 8.4 8.82 8.16 5.16 9.301c-.6.179-1.2-.181-1.38-.721-.18-.601.18-1.2.72-1.381 4.26-1.26 11.28-1.02 15.721 1.621.539.3.719 1.02.419 1.56-.299.421-1.02.599-1.559.3z"/>
+      </svg>
+      <span>Now Playing on Spotify</span>
     </div>
     <div id="title">—</div>
     <div id="artist">—</div>
@@ -105,6 +134,9 @@
     <div id="times"><span id="cur">0:00</span><span id="dur">0:00</span></div>
   </div>
 </div>
+
+<!-- Disconnect control — Developer Policy I.1.2. Hover to reveal. -->
+<button id="disconnect" title="Disconnect your Spotify account and delete stored data">Disconnect Spotify</button>
 
 <!-- ============ SETUP SCREEN ============ -->
 <div id="setup">
@@ -200,9 +232,14 @@ async function refreshToken(){
    Playback polling + rendering
    ============================================================ */
 let accessToken=null, tokenExpiry=0, lastTrackId=null;
-let pbProgress=0;    // position in ms at the last poll
+
+/* Local playback clock.
+   Spotify is polled every 3s (polling faster risks rate limiting), but the
+   timer ticks locally in between so the seconds advance smoothly. Each poll
+   re-syncs this clock to Spotify's real position, so it can't drift. */
+let pbProgress=0;    // progress in ms at the moment of the last poll
 let pbDuration=0;    // track length in ms
-let pbPlaying=false; // was playback active
+let pbPlaying=false; // whether Spotify reported playback as active
 let pbStamp=0;       // performance.now() at the last poll
 
 async function getToken(){
@@ -240,8 +277,12 @@ async function poll(){
       document.getElementById('title').textContent=title;
       document.getElementById('artist').textContent=artists;
       document.getElementById('dur').textContent=fmt(dur);
+      // Link cover art back to the track on Spotify — Developer Policy II.4.2.
+      const trackUrl=(item.external_urls && item.external_urls.spotify) ? item.external_urls.spotify : 'https://open.spotify.com';
+      document.getElementById('artLink').href=trackUrl;
       lastTrackId=item.id;
     }
+    // Re-sync the local clock to Spotify's authoritative position.
     pbProgress=cur; pbDuration=dur; pbPlaying=!!d.is_playing; pbStamp=performance.now();
     render();
 
@@ -251,8 +292,9 @@ async function poll(){
   }catch(e){ /* transient — keep last state */ }
 }
 
-function render()
-{
+/* Paints the current position. Called both by poll (with fresh data) and by
+   the local ticker (interpolating forward from the last poll). */
+function render(){
   let cur=pbProgress;
   if(pbPlaying){ cur += performance.now()-pbStamp; }
   if(pbDuration && cur>pbDuration) cur=pbDuration;
@@ -281,14 +323,34 @@ function hide(){ pbPlaying=false; document.getElementById('overlay').classList.r
   if(LS.refresh){
     document.getElementById('setup').classList.add('hidden');
     poll();
-    setInterval(poll, 3000);
-    setInterval(render, 250);
+    setInterval(poll, 3000);   // re-sync with Spotify
+    setInterval(render, 250);  // smooth local tick between syncs
   }else{
     document.getElementById('setup').classList.remove('hidden');
   }
 })();
 
 document.getElementById('connectBtn').addEventListener('click', startLogin);
+
+/* Disconnect — Developer Policy I.1.2 / I.1.1.
+   Deletes every piece of stored user data and stops all API requests, so the
+   app holds nothing about the user afterwards. Revoking app access on Spotify's
+   own account page is the user's separate, complementary step. */
+function disconnectSpotify(){
+  localStorage.removeItem('sp_refresh');
+  localStorage.removeItem('sp_verifier');
+  localStorage.removeItem('sp_client_id');
+  accessToken=null; tokenExpiry=0; lastTrackId=null;
+  pbPlaying=false; pbProgress=0; pbDuration=0;
+  window.location.href=REDIRECT_URI; // reload into the setup screen
+}
+document.getElementById('disconnect').addEventListener('click', function(){
+  if(confirm('Disconnect Spotify and delete the stored login from this browser?')){
+    disconnectSpotify();
+  }
+});
+// Allow disconnecting via URL too, for OBS sources where hovering isn't possible.
+if(new URL(window.location.href).searchParams.get('disconnect')==='1'){ disconnectSpotify(); }
 </script>
 </body>
 </html>
