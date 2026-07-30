@@ -200,6 +200,10 @@ async function refreshToken(){
    Playback polling + rendering
    ============================================================ */
 let accessToken=null, tokenExpiry=0, lastTrackId=null;
+let pbProgress=0;    // position in ms at the last poll
+let pbDuration=0;    // track length in ms
+let pbPlaying=false; // was playback active
+let pbStamp=0;       // performance.now() at the last poll
 
 async function getToken(){
   const now=Date.now();
@@ -238,8 +242,8 @@ async function poll(){
       document.getElementById('dur').textContent=fmt(dur);
       lastTrackId=item.id;
     }
-    document.getElementById('cur').textContent=fmt(cur);
-    document.getElementById('bar').style.width=(dur? (cur/dur*100):0)+'%';
+    pbProgress=cur; pbDuration=dur; pbPlaying=!!d.is_playing; pbStamp=performance.now();
+    render();
 
     const artEl=document.getElementById('art');
     if(d.is_playing){ artEl.classList.add('spin'); } else { artEl.classList.remove('spin'); }
@@ -247,8 +251,18 @@ async function poll(){
   }catch(e){ /* transient — keep last state */ }
 }
 
+function render()
+{
+  let cur=pbProgress;
+  if(pbPlaying){ cur += performance.now()-pbStamp; }
+  if(pbDuration && cur>pbDuration) cur=pbDuration;
+  if(cur<0) cur=0;
+  document.getElementById('cur').textContent=fmt(cur);
+  document.getElementById('bar').style.width=(pbDuration ? (cur/pbDuration*100) : 0)+'%';
+}
+
 function show(){ document.getElementById('overlay').classList.add('show'); }
-function hide(){ document.getElementById('overlay').classList.remove('show'); }
+function hide(){ pbPlaying=false; document.getElementById('overlay').classList.remove('show'); }
 
 /* ============================================================
    Boot
@@ -268,6 +282,7 @@ function hide(){ document.getElementById('overlay').classList.remove('show'); }
     document.getElementById('setup').classList.add('hidden');
     poll();
     setInterval(poll, 3000);
+    setInterval(render, 250);
   }else{
     document.getElementById('setup').classList.remove('hidden');
   }
