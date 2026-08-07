@@ -17,7 +17,11 @@
     --font: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
   }
 
-  html,body{margin:0;padding:0;background:transparent;overflow:hidden;font-family:var(--font);}
+  /* height:100% matters. Every element below is position:fixed, so without it
+     body collapses to 0px tall and `body:hover` (used to reveal the disconnect
+     control) can only ever match while the cursor is over the card itself.
+     The background stays transparent, so this is invisible in OBS. */
+  html,body{margin:0;padding:0;height:100%;background:transparent;overflow:hidden;font-family:var(--font);}
 
   /* The card */
   /* Position: top-left. To move it elsewhere, swap these two values —
@@ -120,9 +124,13 @@
      Hidden until hover so it never appears on stream (OBS/Streamlabs
      browser sources don't receive mouse-over events).
      Also reachable directly at  <your-url>/?disconnect=1
+
+     top:150px clears the bottom of the card (~137px). Overlapping it meant the
+     only clickable region was the sliver of button sitting on top of the card,
+     and approaching from below crossed dead pixels that switched it back off.
      ============================================================ */
   #disconnect{
-    position:fixed; left:20px; top:112px;
+    position:fixed; left:20px; top:150px;
     font:500 11px var(--font); color:#bbb;
     background:rgba(0,0,0,.72); border:1px solid #444;
     padding:5px 10px; border-radius:999px; cursor:pointer;
@@ -130,6 +138,8 @@
   }
   body:hover #disconnect{opacity:1; pointer-events:auto;}
   #disconnect:hover{border-color:var(--accent); color:#fff;}
+  /* Armed = one click already registered, waiting for the confirming second. */
+  #disconnect.armed{border-color:#e2564a; color:#ff9d92;}
 </style>
 </head>
 <body>
@@ -418,10 +428,28 @@ function disconnectSpotify(){
   pbPlaying=false; pbProgress=0; pbDuration=0;
   window.location.href=REDIRECT_URI; // reload into the setup screen
 }
-document.getElementById('disconnect').addEventListener('click', function(){
-  if(confirm('Disconnect Spotify and delete the stored login from this browser?')){
-    disconnectSpotify();
-  }
+/* Two-click confirmation rather than confirm(). OBS and Streamlabs browser
+   sources run CEF without a dialog handler, so confirm() never draws anything
+   and silently returns false — the button would do nothing there. Clicking
+   once arms the button; a second click within 4s goes through, and it disarms
+   itself if you walk away. */
+const disconnectBtn=document.getElementById('disconnect');
+const DISCONNECT_LABEL=disconnectBtn.textContent;
+let disconnectArmed=false, disarmTimer=null;
+
+function disarmDisconnect(){
+  disconnectArmed=false;
+  clearTimeout(disarmTimer);
+  disconnectBtn.textContent=DISCONNECT_LABEL;
+  disconnectBtn.classList.remove('armed');
+}
+
+disconnectBtn.addEventListener('click', function(){
+  if(disconnectArmed){ disarmDisconnect(); disconnectSpotify(); return; }
+  disconnectArmed=true;
+  disconnectBtn.textContent='Click again to confirm';
+  disconnectBtn.classList.add('armed');
+  disarmTimer=setTimeout(disarmDisconnect, 4000);
 });
 // Allow disconnecting via URL too, for OBS sources where hovering isn't possible.
 if(new URL(window.location.href).searchParams.get('disconnect')==='1'){ disconnectSpotify(); }
