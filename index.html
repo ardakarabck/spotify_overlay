@@ -147,7 +147,9 @@
 <!-- ============ OVERLAY CARD ============ -->
 <div id="overlay">
   <a id="artLink" href="#" target="_blank" rel="noopener">
-    <img id="art" src="" alt="Album cover art">
+    <!-- alt is empty on purpose: a failed image must not paint words on stream. -->
+    <img id="art" class="placeholder" alt=""
+         src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">
   </a>
   <div id="info">
     <div id="eyebrow">
@@ -267,6 +269,10 @@ let accessToken=null, tokenExpiry=0, lastTrackId=null;
    Set to false if you'd rather it disappear entirely between tracks. */
 const SHOW_WHEN_IDLE = true;
 
+/* Transparent 1x1 used whenever there is no artwork to show, so the CSS
+   placeholder shows through instead of a broken-image icon. */
+const BLANK_PIXEL='data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+
 /* Local playback clock.
    Spotify is polled every 3s (polling faster risks rate limiting), but the
    timer ticks locally in between so the seconds advance smoothly. Each poll
@@ -316,7 +322,11 @@ async function poll(){
 
     clearIdle();
     if(item.id!==lastTrackId){
-      document.getElementById('art').src=art;
+      // Tracks without artwork get the blank pixel, not an empty src — an
+      // <img> with no source paints a broken-image icon over the placeholder.
+      const cover=document.getElementById('art');
+      if(art){ cover.src=art; }
+      else{ cover.src=BLANK_PIXEL; cover.classList.add('placeholder'); }
       document.getElementById('title').textContent=title;
       document.getElementById('artist').textContent=artists;
       document.getElementById('dur').textContent=fmt(dur);
@@ -365,10 +375,7 @@ function setIdle(message){
   const art=document.getElementById('art');
   art.classList.remove('spin');
   art.classList.add('placeholder');
-  // A transparent 1x1 rather than removing src — an <img> with no source
-  // makes the browser paint a broken-image icon over the CSS placeholder.
-  art.src='data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
-  art.alt='';
+  art.src=BLANK_PIXEL;
   document.getElementById('title').textContent=message;
   document.getElementById('artist').textContent='';
   document.getElementById('eyebrowText').textContent='Spotify';
@@ -386,13 +393,22 @@ function setIdle(message){
 function clearIdle(){
   const art=document.getElementById('art');
   art.classList.remove('placeholder');
-  art.alt='Album cover art';
   document.getElementById('overlay').classList.remove('idle');
 }
 
 /* ============================================================
    Boot
    ============================================================ */
+/* Cover art is fetched from Spotify's CDN, which can fail where the rest of
+   the API call succeeds — a dropped request inside OBS, or a track with no
+   artwork. Fall back to the placeholder rather than a broken image.
+   The blank pixel loads successfully by design, so it must not clear it. */
+const artImg=document.getElementById('art');
+artImg.addEventListener('error', function(){ artImg.classList.add('placeholder'); });
+artImg.addEventListener('load',  function(){
+  if(artImg.getAttribute('src')!==BLANK_PIXEL){ artImg.classList.remove('placeholder'); }
+});
+
 (async function init(){
   const url=new URL(window.location.href);
   const code=url.searchParams.get('code');
