@@ -143,6 +143,8 @@
   #setup button:hover{filter:brightness(1.08);}
   #setup ol{color:#c8c8c8; padding-left:20px; margin:10px 0;}
   #setup small{color:#7a7a7a;}
+  /* Specificity has to beat `#setup p`, hence the two ids. */
+  #setup #setupError{background:#2a1512; border:1px solid #5c2b24; color:#ff9d92; padding:10px 12px; border-radius:8px; font-size:13px; margin:12px 0 0; word-break:break-word;}
   .hidden{display:none !important;}
 
   /* ============================================================
@@ -202,6 +204,8 @@
 <div id="setup">
   <div class="box">
     <h1>Spotify <span>Now Playing</span> — Setup</h1>
+    <!-- Why the connection ended, when it ended for a reason. Empty on a first run. -->
+    <p id="setupError" class="hidden" role="alert"></p>
     <p>One-time connection. Do this in a normal browser, not inside OBS.</p>
     <ol>
       <li>Go to <b>developer.spotify.com/dashboard</b> → <b>Create app</b>.</li>
@@ -263,28 +267,66 @@ async function startLogin(){
   window.location.href='https://accounts.spotify.com/authorize?'+params.toString();
 }
 
+/* Spotify's token endpoint reports failure in the response body, not only in
+   the status, and the two kinds of failure need opposite handling:
+
+     invalid_grant  the refresh token is gone for good — retrying forever
+                    just rate-limits us and tells the user nothing
+     429 / 5xx      Spotify's end, momentary, worth another go in 3s
+
+   Reading only `data.access_token` conflates them: it comes back undefined and
+   the overlay goes on to send `Bearer undefined`, earning a 401 that looks
+   exactly like a blip. So every token request goes through here. */
+function authError(message, fatal){
+  const e=new Error(message);
+  e.name='AuthError';
+  e.fatal=!!fatal;
+  return e;
+}
+
+async function postToken(body){
+  let r;
+  try{
+    r=await fetch('https://accounts.spotify.com/api/token',{
+      method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body
+    });
+  }catch(netErr){
+    // No response at all: OBS lost the network, or the request was blocked.
+    throw authError('Could not reach Spotify: '+netErr.message, false);
+  }
+  // Read as text first — an error page or a proxy's response isn't valid JSON,
+  // and r.json() would throw over the detail we want to report.
+  const raw=await r.text();
+  let data={};
+  try{ data=JSON.parse(raw); }catch(_){}
+  if(!r.ok || !data.access_token){
+    const detail=data.error_description || data.error || raw.slice(0,200) || 'no detail given';
+    // 4xx other than 429 means the request itself is wrong (dead token, wrong
+    // Client ID, redirect URI mismatch) and will stay wrong.
+    const fatal=data.error==='invalid_grant' || (r.status>=400 && r.status<500 && r.status!==429);
+    throw authError('Spotify rejected the login (HTTP '+r.status+'): '+detail, fatal);
+  }
+  return data;
+}
+
 async function exchangeCode(code){
-  const body=new URLSearchParams({
+  const data=await postToken(new URLSearchParams({
     grant_type:'authorization_code', code, redirect_uri:REDIRECT_URI,
     client_id:LS.cid, code_verifier:LS.verifier
-  });
-  const r=await fetch('https://accounts.spotify.com/api/token',{
-    method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body
-  });
-  const data=await r.json();
+  }));
   if(data.refresh_token){LS.refresh=data.refresh_token;}
   return data.access_token;
 }
 
 async function refreshToken(){
-  const body=new URLSearchParams({
+  if(!LS.refresh){ throw authError('No stored login to refresh.', true); }
+  const data=await postToken(new URLSearchParams({
     grant_type:'refresh_token', refresh_token:LS.refresh, client_id:LS.cid
-  });
-  const r=await fetch('https://accounts.spotify.com/api/token',{
-    method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body
-  });
-  const data=await r.json();
-  if(data.refresh_token){LS.refresh=data.refresh_token;} // Spotify may rotate it
+  }));
+  // Spotify rotates the refresh token and invalidates the one just used, so
+  // storing the new one is mandatory — and two copies of this overlay sharing
+  // one account will rotate each other's token out from under them.
+  if(data.refresh_token){LS.refresh=data.refresh_token;}
   return data.access_token;
 }
 
@@ -292,6 +334,12 @@ async function refreshToken(){
    Playback polling + rendering
    ============================================================ */
 let accessToken=null, tokenExpiry=0, lastTrackId=null;
+let pollTimer=null, tickTimer=null;
+/* Spotify can also reject an access token that was just issued (revoked app
+   access, a scope the app no longer has). Refreshing can't fix that, so count
+   the rejections and give up rather than cycling on 'Reconnecting…' forever. */
+let consecutive401=0;
+const MAX_401 = 5;
 
 /* Keep the card on screen with a placeholder when nothing is playing.
    Set to false if you'd rather it disappear entirely between tracks. */
@@ -330,14 +378,22 @@ async function poll(){
       headers:{Authorization:'Bearer '+token}
     });
     // 204 = Spotify is up but nothing is playing. That's the genuine idle case.
-    if(r.status===204){ setIdle('Nothing playing'); return; }
+    if(r.status===204){ consecutive401=0; setIdle('Nothing playing'); return; }
     // Rate limits and Spotify-side outages are transient — hold the last known
     // state rather than flashing the card away for one bad response.
     if(r.status===429 || r.status>=500){ return; }
     // Token rejected. Drop it so the next poll fetches a fresh one; this
     // recovers on its own within one interval if the refresh token is valid.
-    if(r.status===401){ accessToken=null; tokenExpiry=0; setIdle('Reconnecting…'); return; }
+    if(r.status===401){
+      accessToken=null; tokenExpiry=0;
+      if(++consecutive401>=MAX_401){
+        authFailed(authError('Spotify rejected the access token '+MAX_401+' times running. Access was most likely revoked from your Spotify account page.', true));
+        return;
+      }
+      setIdle('Reconnecting…'); return;
+    }
     if(r.status>=400){ setIdle('Spotify unavailable'); return; }
+    consecutive401=0;
     const d=await r.json();
     if(!d || !d.item){ setIdle('Nothing playing'); return; }
 
@@ -379,7 +435,31 @@ async function poll(){
       document.getElementById('eyebrowText').textContent='Paused on Spotify';
     }
     show();
-  }catch(e){ /* transient — keep last state */ }
+  }catch(e){
+    if(e && e.name==='AuthError'){
+      if(e.fatal){ authFailed(e); return; }
+      // Spotify's end or the network. Say so, log it, try again next interval.
+      console.warn('[overlay] token refresh failed, will retry:', e.message);
+      setIdle('Reconnecting…');
+      return;
+    }
+    /* transient — keep last state */
+  }
+}
+
+/* The login is dead and no retry will revive it. Stop polling (otherwise the
+   overlay hits the token endpoint every 3s with credentials Spotify has
+   already refused, which earns a rate limit on top of the real problem), drop
+   the dead token, and say what happened in the one place the user will look.
+   The Client ID is kept so reconnecting is a single click. */
+function authFailed(err){
+  console.error('[overlay] Spotify authentication failed:', err.message);
+  clearInterval(pollTimer); clearInterval(tickTimer);
+  pollTimer=null; tickTimer=null;
+  localStorage.removeItem('sp_refresh');
+  accessToken=null; tokenExpiry=0; consecutive401=0;
+  setIdle('Spotify login expired — reconnect');
+  showSetup(err.message);
 }
 
 /* Paints the current position. Called both by poll (with fresh data) and by
@@ -449,25 +529,57 @@ artImg.addEventListener('load',  function(){
   if(artImg.getAttribute('src')!==BLANK_PIXEL){ artImg.classList.remove('placeholder'); }
 });
 
+/* Reveal the setup screen, optionally with the reason the last login ended.
+   Prefilling the Client ID matters here: this screen is now also the
+   reconnect screen, and the user shouldn't have to go dig the ID out of the
+   Spotify dashboard again to get back on air. */
+function showSetup(reason){
+  document.getElementById('setup').classList.remove('hidden');
+  const field=document.getElementById('clientId');
+  if(LS.cid && !field.value){ field.value=LS.cid; }
+  const box=document.getElementById('setupError');
+  box.textContent=reason||'';
+  box.classList.toggle('hidden', !reason);
+}
+
+function startPolling(){
+  document.getElementById('setup').classList.add('hidden');
+  poll();
+  pollTimer=setInterval(poll, 3000);   // re-sync with Spotify
+  tickTimer=setInterval(render, 250);  // smooth local tick between syncs
+}
+
 (async function init(){
   const url=new URL(window.location.href);
   const code=url.searchParams.get('code');
+  // Spotify reports a refused authorization in the query string, not the body.
+  const denied=url.searchParams.get('error');
+
+  if(denied){
+    window.history.replaceState({}, document.title, REDIRECT_URI);
+    showSetup('Spotify refused the authorization: '+denied);
+    return;
+  }
 
   if(code){
-    // Returning from Spotify auth — swap code for tokens.
-    await exchangeCode(code);
+    // Returning from Spotify auth — swap code for tokens. A failure here is
+    // usually a redirect URI that doesn't match the dashboard exactly, or a
+    // stale verifier; either way the user needs to be told, not left staring
+    // at a setup screen that looks like nothing happened.
+    try{
+      await exchangeCode(code);
+    }catch(e){
+      window.history.replaceState({}, document.title, REDIRECT_URI);
+      console.error('[overlay] code exchange failed:', e.message);
+      showSetup(e.message);
+      return;
+    }
     // Clean the URL so ?code=... doesn't linger.
     window.history.replaceState({}, document.title, REDIRECT_URI);
   }
 
-  if(LS.refresh){
-    document.getElementById('setup').classList.add('hidden');
-    poll();
-    setInterval(poll, 3000);   // re-sync with Spotify
-    setInterval(render, 250);  // smooth local tick between syncs
-  }else{
-    document.getElementById('setup').classList.remove('hidden');
-  }
+  if(LS.refresh){ startPolling(); }
+  else{ showSetup(''); }
 })();
 
 document.getElementById('connectBtn').addEventListener('click', startLogin);
