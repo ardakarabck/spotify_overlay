@@ -9,3 +9,6 @@ desktop.ini
 # Editor backups
 *~
 *.swp
+
+# helper.py's stored login — holds a live Spotify refresh token
+helper_config.json

@@ -371,7 +371,41 @@ function fmt(ms){
   return m+':'+String(s%60).padStart(2,'0');
 }
 
-async function poll(){
+/* Two routes to the same data. Hosted (GitHub Pages), the page talks to
+   Spotify itself. Served from localhost, helper.py has already done that and
+   this page just reads the result.
+
+   The helper exists because the embedded Chromium in Streamlabs and OBS cannot
+   complete a TLS handshake with accounts.spotify.com, while the very same
+   machine can — so the token refresh is moved out to Python, and the browser
+   source is left speaking plain HTTP to localhost, where there is no handshake
+   to fail. */
+const HELPER_MODE = ['localhost','127.0.0.1','[::1]','::1'].includes(location.hostname);
+
+function poll(){ return HELPER_MODE ? pollHelper() : pollDirect(); }
+
+/* The helper returns Spotify's own currently-playing body under a wrapper that
+   also carries its failures: it holds the credentials now, so it is the only
+   side that knows when the login has died. */
+async function pollHelper(){
+  try{
+    const r=await fetch('nowplaying',{cache:'no-store'});
+    if(!r.ok){ setIdle('Helper error '+r.status); return; }
+    const env=await r.json();
+    if(env.state==='error'){
+      console.error('[overlay] helper:', env.message);
+      setIdle(env.fatal ? 'Login expired — rerun helper.py' : 'Reconnecting…');
+      return;
+    }
+    if(env.state==='idle'){ setIdle(env.message||'Nothing playing'); return; }
+    applyPlayback(env.data);
+  }catch(e){
+    // Helper stopped, or hasn't finished starting. It may well come back.
+    setIdle('Helper not running');
+  }
+}
+
+async function pollDirect(){
   try{
     const token=await getToken();
     const r=await fetch('https://api.spotify.com/v1/me/player/currently-playing',{
@@ -394,47 +428,7 @@ async function poll(){
     }
     if(r.status>=400){ setIdle('Spotify unavailable'); return; }
     consecutive401=0;
-    const d=await r.json();
-    if(!d || !d.item){ setIdle('Nothing playing'); return; }
-
-    const item=d.item;
-    const art=(item.album && item.album.images && item.album.images[0]) ? item.album.images[0].url : '';
-    const title=item.name||'';
-    const artists=(item.artists||[]).map(a=>a.name).join(', ');
-    const dur=item.duration_ms||0;
-    const cur=d.progress_ms||0;
-
-    clearIdle();
-    if(item.id!==lastTrackId){
-      // Tracks without artwork get the blank pixel, not an empty src — an
-      // <img> with no source paints a broken-image icon over the placeholder.
-      const cover=document.getElementById('art');
-      if(art){ cover.src=art; }
-      else{ cover.src=BLANK_PIXEL; cover.classList.add('placeholder'); }
-      document.getElementById('title').textContent=title;
-      document.getElementById('artist').textContent=artists;
-      document.getElementById('dur').textContent=fmt(dur);
-      // Link cover art back to the track on Spotify — Developer Policy II.4.2.
-      const trackUrl=(item.external_urls && item.external_urls.spotify) ? item.external_urls.spotify : 'https://open.spotify.com';
-      document.getElementById('artLink').href=trackUrl;
-      lastTrackId=item.id;
-    }
-    // Re-sync the local clock to Spotify's authoritative position.
-    pbProgress=cur; pbDuration=dur; pbPlaying=!!d.is_playing; pbStamp=performance.now();
-    render();
-
-    // Paused still shows the track — it just stops spinning, drops the
-    // equalizer bars, and says so. Attribution stays either way.
-    const artEl=document.getElementById('art');
-    const overlay=document.getElementById('overlay');
-    if(d.is_playing){
-      artEl.classList.add('spin'); overlay.classList.remove('paused');
-      document.getElementById('eyebrowText').textContent='Now Playing on Spotify';
-    }else{
-      artEl.classList.remove('spin'); overlay.classList.add('paused');
-      document.getElementById('eyebrowText').textContent='Paused on Spotify';
-    }
-    show();
+    applyPlayback(await r.json());
   }catch(e){
     if(e && e.name==='AuthError'){
       if(e.fatal){ authFailed(e); return; }
@@ -445,6 +439,50 @@ async function poll(){
     }
     /* transient — keep last state */
   }
+}
+
+/* Paint one currently-playing body, whichever route it arrived by. */
+function applyPlayback(d){
+  if(!d || !d.item){ setIdle('Nothing playing'); return; }
+
+  const item=d.item;
+  const art=(item.album && item.album.images && item.album.images[0]) ? item.album.images[0].url : '';
+  const title=item.name||'';
+  const artists=(item.artists||[]).map(a=>a.name).join(', ');
+  const dur=item.duration_ms||0;
+  const cur=d.progress_ms||0;
+
+  clearIdle();
+  if(item.id!==lastTrackId){
+    // Tracks without artwork get the blank pixel, not an empty src — an
+    // <img> with no source paints a broken-image icon over the placeholder.
+    const cover=document.getElementById('art');
+    if(art){ cover.src=art; }
+    else{ cover.src=BLANK_PIXEL; cover.classList.add('placeholder'); }
+    document.getElementById('title').textContent=title;
+    document.getElementById('artist').textContent=artists;
+    document.getElementById('dur').textContent=fmt(dur);
+    // Link cover art back to the track on Spotify — Developer Policy II.4.2.
+    const trackUrl=(item.external_urls && item.external_urls.spotify) ? item.external_urls.spotify : 'https://open.spotify.com';
+    document.getElementById('artLink').href=trackUrl;
+    lastTrackId=item.id;
+  }
+  // Re-sync the local clock to Spotify's authoritative position.
+  pbProgress=cur; pbDuration=dur; pbPlaying=!!d.is_playing; pbStamp=performance.now();
+  render();
+
+  // Paused still shows the track — it just stops spinning, drops the
+  // equalizer bars, and says so. Attribution stays either way.
+  const artEl=document.getElementById('art');
+  const overlay=document.getElementById('overlay');
+  if(d.is_playing){
+    artEl.classList.add('spin'); overlay.classList.remove('paused');
+    document.getElementById('eyebrowText').textContent='Now Playing on Spotify';
+  }else{
+    artEl.classList.remove('spin'); overlay.classList.add('paused');
+    document.getElementById('eyebrowText').textContent='Paused on Spotify';
+  }
+  show();
 }
 
 /* The login is dead and no retry will revive it. Stop polling (otherwise the
@@ -550,6 +588,15 @@ function startPolling(){
 }
 
 (async function init(){
+  // Helper mode: helper.py holds the credentials and does the refreshing, so
+  // there is nothing to set up here, nothing stored here to disconnect, and no
+  // auth round trip for the embedded browser to choke on.
+  if(HELPER_MODE){
+    document.getElementById('disconnect').classList.add('hidden');
+    startPolling();
+    return;
+  }
+
   const url=new URL(window.location.href);
   const code=url.searchParams.get('code');
   // Spotify reports a refused authorization in the query string, not the body.
@@ -620,7 +667,8 @@ disconnectBtn.addEventListener('click', function(){
   disarmTimer=setTimeout(disarmDisconnect, 4000);
 });
 // Allow disconnecting via URL too, for OBS sources where hovering isn't possible.
-if(new URL(window.location.href).searchParams.get('disconnect')==='1'){ disconnectSpotify(); }
+// Nothing to erase in helper mode — revoke there by deleting helper_config.json.
+if(!HELPER_MODE && new URL(window.location.href).searchParams.get('disconnect')==='1'){ disconnectSpotify(); }
 </script>
 </body>
 </html>

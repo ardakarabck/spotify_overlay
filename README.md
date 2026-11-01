@@ -66,6 +66,60 @@ Kick broadcasts whatever OBS outputs, so nothing further is needed on Kick's sid
 
 ---
 
+## When the browser source can't reach Spotify
+
+The overlay normally talks to Spotify straight from the browser source. On some
+machines that stops working: the embedded Chromium in Streamlabs Desktop and OBS
+fails the TLS handshake with `accounts.spotify.com` and shows
+`ERR_SSL_PROTOCOL_ERROR`, while curl, Chrome and Python on the very same machine
+reach that host without complaint.
+
+The symptom is the card sitting on **Reconnecting…** roughly an hour after the
+overlay starts. That is the access token expiring with no way to refresh it.
+
+`helper.py` moves the part that needs TLS out of the browser source. It holds the
+refresh token, talks to Spotify over Python's own TLS stack, and serves the
+overlay plus a `/nowplaying` endpoint on loopback. The browser source then only
+speaks plain HTTP to `127.0.0.1`, where there is no handshake to get wrong.
+
+Standard library only — no `pip install`.
+
+### Setup
+
+1. In your Spotify app, add a second **Redirect URI**, exactly:
+   `http://127.0.0.1:8765/callback`
+2. Run it:
+   ```
+   python helper.py
+   ```
+   The first run asks for your Client ID and opens a normal browser to log in.
+   Both are saved to `helper_config.json` — gitignored, because it holds a live
+   refresh token.
+3. Point the browser source at `http://127.0.0.1:8765/` instead of the Pages URL.
+4. Leave it running while you stream.
+
+| Flag | |
+|---|---|
+| `--port 8766` | if 8765 is taken — change the Redirect URI to match |
+| `--reauth` | discard the stored login and log in again |
+
+On Windows, **`start_overlay.bat`** does the same from a double-click. It runs
+`helper.py` from its own folder, so a desktop shortcut to it works from
+anywhere, and it holds the window open after the helper stops so a startup
+error is readable instead of vanishing with the console. Flags pass through, so
+a shortcut can carry `--reauth` or `--port` in its Target.
+
+`index.html` notices it is being served from localhost and reads `/nowplaying`
+instead of calling Spotify itself. The same file still works unchanged on GitHub
+Pages, so the hosted setup above is untouched.
+
+This also fixes a subtler failure. Spotify rotates the refresh token on every
+refresh and invalidates the one just used, so two copies of the hosted overlay on
+one account — a browser source and a forgotten browser tab, say — will knock each
+other offline. One helper process owns the token, so there is no race.
+
+---
+
 ## Customizing
 
 All styling lives in the `:root` block at the top of `index.html`:
@@ -136,10 +190,14 @@ needed and nothing sensitive is stored in this repository. Your Client ID and
 refresh token are kept in your browser's `localStorage` and never leave your
 device except when sent to Spotify.
 
+Under the helper, those same two values live in `helper_config.json` on your
+machine instead of in `localStorage`, and the browser source holds nothing at
+all.
+
 **To disconnect:** hover over the page and click **Disconnect Spotify**, or open
 the overlay with `?disconnect=1` appended. This erases all stored values
-immediately. You can additionally revoke access from your Spotify account page
-under **Apps**.
+immediately. Under the helper, stop it and delete `helper_config.json`. You can
+additionally revoke access from your Spotify account page under **Apps**.
 
 Full details in [PRIVACY.md](PRIVACY.md).
 
